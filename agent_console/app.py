@@ -2999,6 +2999,12 @@ def read_http_response(sock: socket.socket, timeout: int) -> tuple[int, dict[str
                 break
             response_body += chunk
         response_body = decode_http_chunked(response_body)
+    elif "application/vnd.docker.raw-stream" in headers_lower.get("content-type", "").lower():
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response_body += chunk
     return status, headers_lower, response_body
 
 
@@ -3501,6 +3507,20 @@ def prepare_verified_wechat_chat(
     target_name = preferred_chat_display_name(chat_username, chat_display_name) or clean_contact_text(chat_username)
     if not chat_username:
         return {"ok": False, "error": "缺少目标群 chatroom id，拒绝切换以避免发错群"}
+    private = not chat_username.endswith("@chatroom")
+    if private:
+        try:
+            with db_connect(CONTACT_DB, readonly=True) as conn:
+                matches = conn.execute(
+                    "SELECT username FROM contact WHERE remark=? OR nick_name=?",
+                    (target_name, target_name),
+                ).fetchall()
+            with db_connect(MEMORY_DB, readonly=True) as conn:
+                chat_matches = conn.execute("SELECT username FROM chats WHERE display_name=?", (target_name,)).fetchall()
+            if len(matches) != 1 or matches[0][0] != chat_username or len(chat_matches) != 1 or chat_matches[0][0] != chat_username:
+                return {"ok": False, "error": "私聊联系人名称不唯一，拒绝发送"}
+        except (sqlite3.Error, OSError):
+            return {"ok": False, "error": "无法验证私聊联系人，拒绝发送"}
     initial_refresh = refresh_probe_session_db(force=True)
     before_position = recent_session_position(chat_username)
     if not before_position:
@@ -3536,8 +3556,11 @@ def prepare_verified_wechat_chat(
             }
         )
     switch_delay = float((delays or {}).get("switch_delay_seconds") or 1.0)
+    controller_args = ["open", "--chat-name-b64", b64_arg(target_name), "--switch-delay", str(switch_delay)]
+    if private:
+        controller_args += ["--private-target-b64", b64_arg(target_name)]
     opened = run_wechat_controller(
-        ["open", "--chat-name-b64", b64_arg(target_name), "--switch-delay", str(switch_delay)],
+        controller_args,
         timeout=20,
     )
     if not opened.get("ok"):
@@ -3846,6 +3869,10 @@ def paste_reply_to_wechat(
         )
     if send and not can_blue_mention and (not draft_verify or not draft_verify.get("ok")):
         open_verify = verify_opened_target_chat(verified.get("details", {}), chat_username)
+        if not chat_username.endswith("@chatroom"):
+            details = verified.get("details", {})
+            controller = details.get("controller", {}).get("controller", {})
+            open_verify = {"ok": controller.get("private_verified") is True, "reason": "private_title_check"}
         draft_owners = {str(owner or "") for owner in ((draft_verify or {}).get("owners") or [])}
         wrong_owner = bool(draft_owners and chat_username not in draft_owners)
         if not open_verify.get("ok") or wrong_owner:
@@ -3905,8 +3932,11 @@ def paste_reply_to_wechat(
         )
     submit = {}
     if send:
+        submit_args = ["submit", "--send-delay", str(float(delays.get("send_delay_seconds") or 0.0))]
+        if not chat_username.endswith("@chatroom"):
+            submit_args += ["--private-target-b64", b64_arg(target_name)]
         submit = run_wechat_controller(
-            ["submit", "--send-delay", str(float(delays.get("send_delay_seconds") or 0.0))],
+            submit_args,
             timeout=35,
         )
         if not submit.get("ok"):
@@ -8564,15 +8594,16 @@ def reset_auto_reply_watermarks_to_latest(config: dict) -> dict:
         with db_connect(MEMORY_DB, readonly=True) as conn:
             chat_rows = conn.execute(
                 """
-                SELECT username, display_name
+                SELECT username, display_name, is_group
                 FROM chats
-                WHERE COALESCE(is_group, 0)=1
                 """
             ).fetchall()
             for chat_row in chat_rows:
                 chat = str(chat_row["username"] or "")
                 display = str(chat_row["display_name"] or "")
                 if not chat:
+                    continue
+                if not chat_row["is_group"] and chat not in allowed:
                     continue
                 if allowed and chat not in allowed and display not in allowed:
                     continue
@@ -8581,11 +8612,11 @@ def reset_auto_reply_watermarks_to_latest(config: dict) -> dict:
                     SELECT message_uid, chat_username, chat_display_name, local_id, create_time
                     FROM messages
                     WHERE chat_username=?
-                      AND COALESCE(origin_source, 0)!=1
+                      AND (? OR COALESCE(origin_source, 0)!=1)
                     ORDER BY create_time DESC, local_id DESC
                     LIMIT 1
                     """,
-                    (chat,),
+                    (chat, not chat_row["is_group"]),
                 ).fetchone()
                 watermarks[chat] = chat_watermark(dict(latest) if latest else None)
     except sqlite3.Error as exc:
@@ -8637,6 +8668,20 @@ def is_bot_mention_row(row: dict, config: dict) -> bool:
     )
 
 
+def is_private_incoming(row: dict) -> bool:
+    chat = str(row.get("chat_username") or "")
+    try:
+        path = Path(str(row.get("source_message_db") or "")).resolve()
+        root = (ROOT / "runtime/wechat-decrypt/decrypted/message").resolve()
+        if path.parent != root or not re.fullmatch(r"message_\d+\.db", path.name):
+            return False
+        with db_connect(path, readonly=True) as conn:
+            sender = conn.execute("SELECT user_name FROM Name2Id WHERE rowid=?", (row.get("real_sender_id"),)).fetchone()
+        return bool(sender and sender[0] == chat)
+    except (OSError, sqlite3.Error, ValueError):
+        return False
+
+
 def auto_reply_candidate_messages(config: dict, state: dict, limit: int) -> list[dict]:
     if not MEMORY_DB.exists():
         return []
@@ -8650,9 +8695,8 @@ def auto_reply_candidate_messages(config: dict, state: dict, limit: int) -> list
         with db_connect(MEMORY_DB, readonly=True) as conn:
             chat_rows = conn.execute(
                 """
-                SELECT username, display_name
+                SELECT username, display_name, is_group
                 FROM chats
-                WHERE COALESCE(is_group, 0)=1
                 ORDER BY COALESCE(sort_timestamp, last_timestamp, 0) DESC, username ASC
                 """
             ).fetchall()
@@ -8660,6 +8704,8 @@ def auto_reply_candidate_messages(config: dict, state: dict, limit: int) -> list
             for chat_row in chat_rows:
                 chat = str(chat_row["username"] or "")
                 if not chat:
+                    continue
+                if not chat_row["is_group"] and chat not in allowed:
                     continue
                 if allowed and chat not in allowed and str(chat_row["display_name"] or "") not in allowed:
                     continue
@@ -8678,11 +8724,11 @@ def auto_reply_candidate_messages(config: dict, state: dict, limit: int) -> list
                         SELECT message_uid, chat_username, chat_display_name, local_id, create_time
                         FROM messages
                         WHERE chat_username=?
-                          AND COALESCE(origin_source, 0)!=1
+                          AND (? OR COALESCE(origin_source, 0)!=1)
                         ORDER BY create_time DESC, local_id DESC
                         LIMIT 1
                         """,
-                        (chat,),
+                        (chat, not chat_row["is_group"]),
                     ).fetchone()
                     watermarks[chat] = chat_watermark(dict(latest) if latest else None)
                     watermarks_changed = True
@@ -8691,18 +8737,20 @@ def auto_reply_candidate_messages(config: dict, state: dict, limit: int) -> list
                     """
                     SELECT message_uid, chat_username, chat_display_name, type_label,
                            create_time, local_id, source, message_content, compress_content,
-                           origin_source
+                           origin_source, real_sender_id, source_message_db
                     FROM messages
                     WHERE chat_username=?
-                      AND COALESCE(origin_source, 0)!=1
+                      AND (? OR COALESCE(origin_source, 0)!=1)
                       AND (COALESCE(create_time, 0)>?
                            OR (COALESCE(create_time, 0)=? AND COALESCE(local_id, 0)>?))
                     ORDER BY create_time ASC, local_id ASC
                     LIMIT ?
                     """,
-                    (chat, since_time, since_time, since_local, per_chat_fetch),
+                    (chat, not chat_row["is_group"], since_time, since_time, since_local, per_chat_fetch),
                 ).fetchall()
                 rows = [dict(row) for row in new_rows]
+                if not chat_row["is_group"]:
+                    rows = [row for row in rows if is_private_incoming(row)]
                 if rows:
                     per_chat_rows.append(rows)
     except sqlite3.Error as exc:
@@ -8743,6 +8791,8 @@ def auto_reply_candidate_messages(config: dict, state: dict, limit: int) -> list
 
 
 def is_self_message(row: dict) -> bool:
+    if not str(row.get("chat_username") or "").endswith("@chatroom") and "source_message_db" in row:
+        return not is_private_incoming(row)
     sender, _ = message_index_text(row)
     if sender:
         return False
@@ -10240,6 +10290,9 @@ def auto_reply_execute_message(row: dict, config: dict) -> dict:
         set_auto_reply_live("skipped", message, error="unsupported_message_type")
         auto_reply_skip(message, "unsupported_message_type")
         return {"ok": True, "skipped": True, "reason": "unsupported_message_type"}
+    if not chat_username.endswith("@chatroom") and str(message.get("type_label") or "") != "text":
+        auto_reply_skip(message, "private_non_text")
+        return {"ok": True, "skipped": True, "reason": "private_non_text"}
     if not reply_effective.get("enabled", True) and not detect_bot_mention(text, config, chat_username).get("mentions_bot"):
         set_auto_reply_live("skipped", message, error="chat_auto_reply_disabled", details={"chat_reply": reply_effective})
         auto_reply_skip(message, "chat_auto_reply_disabled")
@@ -10263,7 +10316,8 @@ def auto_reply_execute_message(row: dict, config: dict) -> dict:
     set_auto_reply_live("scoring", message)
     sender_identity = sender_identity_for_message(message)
     mention_info = detect_bot_mention(text, config, str(message.get("chat_username") or ""))
-    mention_plan = reply_mention_plan(message, config, sender_identity, mention_info)
+    private_chat = not chat_username.endswith("@chatroom")
+    mention_plan = {} if private_chat else reply_mention_plan(message, config, sender_identity, mention_info)
     mention_required = bool(mention_plan.get("required"))
     reply_to_sender = bool(mention_plan.get("should_mention"))
     mention_target = clean_contact_text(mention_plan.get("target") or "")
@@ -10315,6 +10369,8 @@ def auto_reply_execute_message(row: dict, config: dict) -> dict:
     )
     mode_key = reply_effective.get("reply_mode") or config.get("agent", {}).get("reply_mode", "normal")
     scoring = evaluate_talk({"text": text, "mode": mode_key, "context": context}, config=config)
+    if private_chat and not scoring.get("suppressions"):
+        scoring["decision"] = "reply"
     scoring["chat_reply"] = {
         key: value
         for key, value in reply_effective.items()
@@ -10325,11 +10381,11 @@ def auto_reply_execute_message(row: dict, config: dict) -> dict:
         auto_reply_skip(message, "score_below_threshold", scoring)
         return {"ok": True, "skipped": True, "reason": "score_below_threshold", "scoring": scoring}
 
-    skill_result = maybe_execute_auto_skill(message, config, scoring)
+    skill_result = {} if private_chat else maybe_execute_auto_skill(message, config, scoring)
     if skill_result.get("handled"):
         return skill_result
 
-    if is_daily_report_request(text):
+    if not private_chat and is_daily_report_request(text):
         target = report_request_target(message)
         if not target.get("ok"):
             set_auto_reply_live("failed", message, scoring=scoring, error=target.get("error") or "日报目标群解析失败")

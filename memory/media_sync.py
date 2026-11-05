@@ -488,6 +488,12 @@ def sync_image(row: sqlite3.Row, args, resource_map: dict[tuple[str, int], str],
             "error": "local .dat cache not found",
         }
     data, fmt = decrypt_dat(selected, cfg.get("image_aes_key"), int(cfg.get("image_xor_key", 0x88)))
+    if fmt == "hevc":
+        thumb = next((path for path in dat_files if path.name.endswith("_t.dat")), None)
+        if thumb:
+            thumb_data, thumb_fmt = decrypt_dat(thumb, cfg.get("image_aes_key"), int(cfg.get("image_xor_key", 0x88)))
+            if thumb_data and thumb_fmt and thumb_fmt != "hevc":
+                selected, data, fmt = thumb, thumb_data, thumb_fmt
     if not data or not fmt:
         return {
             "message_uid": row["message_uid"],

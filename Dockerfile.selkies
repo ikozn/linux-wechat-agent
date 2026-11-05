@@ -1,0 +1,9 @@
+FROM ghcr.io/nickrunning/wechat-selkies:0.0.12-minimal
+USER root
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl tesseract-ocr tesseract-ocr-chi-sim \
+    && case "$(dpkg --print-architecture)" in amd64) pkg=WeChatLinux_x86_64.deb ;; arm64) pkg=WeChatLinux_arm64.deb ;; *) exit 1 ;; esac \
+    && curl -fsSL "https://dldir1.qq.com/weixin/Universal/Linux/${pkg}" -o /tmp/wechat.deb \
+    && dpkg -i /tmp/wechat.deb \
+    && python3 -m pip install --no-cache-dir --target /opt/wechat-frida frida==17.25.2 \
+    && rm /tmp/wechat.deb \
+    && rm -rf /var/lib/apt/lists/*

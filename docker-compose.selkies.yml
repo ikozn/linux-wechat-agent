@@ -1,0 +1,6 @@
+services:
+  wechat-selkies:
+    build:
+      context: .
+      dockerfile: Dockerfile.selkies
+    image: wechat-selkies-agent:local

@@ -32,3 +32,8 @@ __pycache__/
 *.db-wal
 tmp/
 *.tmp
+node_modules/
+.output/
+.nitro/
+src/paraglide/runtime.js
+src/routeTree.gen.ts

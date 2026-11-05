@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Small X11 controller for the Linux WeChat window.
 
-This script intentionally does not inspect screenshots or write WeChat databases.
-It drives the main Linux WeChat window through X11 and closes embedded web
-windows that would otherwise steal focus.
+It drives the main Linux WeChat window through X11 and checks private-chat
+titles before sending. It does not write WeChat databases.
 """
 
 from __future__ import annotations
@@ -105,7 +104,7 @@ def find_main_window() -> dict:
         height = int(geom.get("height") or 0)
         name = window_name(window_id.strip())
         props = xprop(window_id.strip())
-        if name != "微信" or width < 240 or height < 320 or "wechat" not in props:
+        if name not in {"微信", "Weixin", "WeChat"} or width < 240 or height < 320 or "wechat" not in props:
             continue
         geom["name"] = name
         geom["area"] = width * height
@@ -300,7 +299,25 @@ def chat_search_query(chat_name: str) -> str:
     return compact[:2] or chat_name.strip()
 
 
-def open_chat(chat_name: str, switch_delay: float) -> dict:
+def private_title_matches(window: dict, chat_name: str) -> bool:
+    from io import BytesIO
+    from PIL import ImageGrab
+
+    # shortcut: fixed window geometry, add calibrated layouts before supporting other sizes
+    if (window["width"], window["height"]) != (1760, 1280):
+        return False
+    x, y = window["x"], window["y"]
+    image = ImageGrab.grab(bbox=(x + 600, y + 64, x + 1000, y + 154))
+    data = BytesIO()
+    image.save(data, format="PNG")
+    result = subprocess.run(
+        ["tesseract", "stdin", "stdout", "-l", "chi_sim+eng", "--psm", "7"],
+        input=data.getvalue(), capture_output=True, timeout=8,
+    )
+    return result.returncode == 0 and re.sub(r"\s+", "", result.stdout.decode("utf-8", "replace")) == re.sub(r"\s+", "", chat_name)
+
+
+def open_chat(chat_name: str, switch_delay: float, private: bool = False) -> dict:
     chat_name = chat_name.strip()
     if not chat_name:
         raise RuntimeError("缺少目标群名")
@@ -309,6 +326,20 @@ def open_chat(chat_name: str, switch_delay: float) -> dict:
     activate(window)
     width = int(window["width"])
     height = int(window["height"])
+
+    if private:
+        if not private_title_matches(window, chat_name):
+            if (width, height) != (1760, 1280):
+                raise RuntimeError("私聊窗口尺寸不受支持，拒绝发送")
+            click(window, 200, 110)
+            clear_focused_text()
+            paste_text(chat_name)
+            sleep_seconds(0.8)
+            key("Return")
+            sleep_seconds(max(switch_delay, 0.2))
+        if not private_title_matches(window, chat_name):
+            raise RuntimeError("无法确认私聊窗口标题，拒绝发送")
+        return {"window": window, "chat_name": chat_name, "private_verified": True}
 
     key("Escape")
     sleep_seconds(0.08)
@@ -485,10 +516,12 @@ def paste_image_active(path: str, send: bool, send_delay: float) -> dict:
     }
 
 
-def submit_active(send_delay: float) -> dict:
+def submit_active(send_delay: float, private_target: str = "") -> dict:
     window = find_main_window()
     activate(window)
     sleep_seconds(max(send_delay, 0))
+    if private_target and not private_title_matches(window, private_target):
+        raise RuntimeError("发送前私聊窗口标题不匹配，拒绝发送")
     key("Return")
     return {"window": window, "sent": True, "send_delay_seconds": send_delay}
 
@@ -546,6 +579,7 @@ def main() -> int:
         choices=["open", "paste", "mention-paste", "image", "submit", "focus", "status", "clear", "login-guard-click"],
     )
     parser.add_argument("--chat-name-b64", default="")
+    parser.add_argument("--private-target-b64", default="")
     parser.add_argument("--text-b64", default="")
     parser.add_argument("--mention-alias-b64", default="")
     parser.add_argument("--mention-display-b64", default="")
@@ -558,7 +592,7 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.action == "open":
-            payload = open_chat(b64_decode(args.chat_name_b64), args.switch_delay)
+            payload = open_chat(b64_decode(args.chat_name_b64), args.switch_delay, bool(args.private_target_b64))
         elif args.action == "paste":
             payload = paste_active(b64_decode(args.text_b64), args.send, args.send_delay)
         elif args.action == "mention-paste":
@@ -572,7 +606,7 @@ def main() -> int:
         elif args.action == "image":
             payload = paste_image_active(b64_decode(args.image_path_b64), args.send, args.send_delay)
         elif args.action == "submit":
-            payload = submit_active(args.send_delay)
+            payload = submit_active(args.send_delay, b64_decode(args.private_target_b64))
         elif args.action == "focus":
             payload = focus_active()
         elif args.action == "status":
